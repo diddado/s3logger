@@ -39,7 +39,15 @@ type S3LogRotator struct {
 	fileCount   int   // internal counter for the current hour file number
 	maxFileSize int64 // maximum allowed file size in bytes
 
-	closeCallback func() // the function to call after closing.  Usually a WaitGroup Done()
+	closeCallback       func() // the function to call after closing.  Usually a WaitGroup Done()
+	afterUploadCallback func(S3LogRotatorUploadResult)
+}
+
+type S3LogRotatorUploadResult struct {
+	Bucket       string
+	Key          string
+	PresignedURL string
+	ValidUntil   time.Time
 }
 
 // NewS3LogRotator now accepts maxFileSize (in bytes) and determines the starting fileCount.
@@ -86,6 +94,10 @@ func NewS3LogRotator(topic, logDir, s3Bucket, s3Path string, flushInterval time.
 
 func (fr *S3LogRotator) GetTopic() string {
 	return fr.topic
+}
+
+func (fr *S3LogRotator) SetAfterUploadCallback(cb func(S3LogRotatorUploadResult)) {
+	fr.afterUploadCallback = cb
 }
 
 // getLocalCurrentHourFileCount scans the local logDir for files matching the current hour pattern.
@@ -380,6 +392,28 @@ func (fr *S3LogRotator) uploadToS3(file *os.File) error {
 		return fmt.Errorf("failed to upload to s3: %w", err)
 	}
 	log.Printf("Uploaded compressed file %s (%d bytes) to S3 bucket %s", key, compressedSize, fr.s3Bucket)
+
+	// Generate presigned URL and call callback if set
+	if fr.afterUploadCallback != nil {
+		req, _ := fr.s3Client.GetObjectRequest(&s3.GetObjectInput{
+			Bucket: aws.String(fr.s3Bucket),
+			Key:    aws.String(key),
+		})
+		validPeriod := 7 * 24 * time.Hour
+		validUntil := time.Now().Add(validPeriod)
+		url, err := req.Presign(validPeriod)
+		if err != nil {
+			log.Printf("Error generating presigned URL for %s/%s: %v", fr.s3Bucket, key, err)
+		} else {
+			result := S3LogRotatorUploadResult{
+				Bucket:       fr.s3Bucket,
+				Key:          key,
+				PresignedURL: url,
+				ValidUntil:   validUntil,
+			}
+			fr.afterUploadCallback(result)
+		}
+	}
 	return nil
 }
 
